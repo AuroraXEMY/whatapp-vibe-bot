@@ -489,11 +489,38 @@ sock.ev.on("connection.update", async (update) => {
     console.log("\n📱 SCAN THE GENERATED QR CODE TO REGISTER THE BOT:");
   }
 
-  if (connection === "close") {
+    if (connection === "close") {
     const statusCode = lastDisconnect?.error?.output?.statusCode ?? lastDisconnect?.error?.statusCode;
-    const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.badSession;
+    // 405 error is a "Method Not Allowed" often indicating session conflict
+    const isFatal = statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession;
+    const shouldReconnect = !isFatal;
 
     console.log(`⚠️ Connection closed. Status Code: ${statusCode}. Reconnect: ${shouldReconnect}`);
+
+    if (shuttingDown || !shouldReconnect) {
+      if (!shuttingDown) console.error("❌ Fatal error. Clear MongoDB auth and pair again.");
+      return; 
+    }
+
+    if (reconnecting) return;
+    reconnecting = true;
+    reconnectAttempts++;
+
+    // If we hit a 405, we wait 2 minutes to allow the server to reset your state
+    const delayTime = (statusCode === 405) ? 120000 : Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60000);
+    
+    console.log(`🔄 Reconnecting in ${(delayTime / 1000).toFixed(0)} seconds... (Attempt ${reconnectAttempts})`);
+
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      try {
+        await startBot();
+      } catch (err) {
+        console.error("Reconnection failed:", err);
+        reconnecting = false;
+      }
+    }, delayTime);
+  }
 
     if (shuttingDown || !shouldReconnect) {
       if (!shuttingDown) console.error("❌ Fatal error. Clear MongoDB auth and pair again.");
