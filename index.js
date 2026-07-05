@@ -476,38 +476,64 @@ async function startBot() {
   }
 
   // --- PROTECTION TIER 10: AUTOMATIC SOCKET RECONNECTION BACKOFF ---
-  let reconnectAttempts = 0;
-  
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  // --- PROTECTION TIER 10: AUTOMATIC SOCKET RECONNECTION BACKOFF ---
+let reconnecting = false;
+let shuttingDown = false;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
 
-    if (qr && !usePairingCode) {
-      console.log("\n📱 SCAN THE GENERATED QR CODE TO REGISTER THE BOT:");
+sock.ev.on("connection.update", async (update) => {
+  const { connection, lastDisconnect, qr } = update;
+
+  if (qr && !usePairingCode) {
+    console.log("\n📱 SCAN THE GENERATED QR CODE TO REGISTER THE BOT:");
+  }
+
+  if (connection === "close") {
+    const statusCode = lastDisconnect?.error?.output?.statusCode ?? lastDisconnect?.error?.statusCode;
+    const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.badSession;
+
+    console.log(`⚠️ Connection closed. Status Code: ${statusCode}. Reconnect: ${shouldReconnect}`);
+
+    if (shuttingDown || !shouldReconnect) {
+      if (!shuttingDown) console.error("❌ Fatal error. Clear MongoDB auth and pair again.");
+      return; 
     }
 
-    if (connection === "close") {
-      const statusCode = lastDisconnect.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      
-      console.log(`⚠️ Connection disconnected. Status Code: ${statusCode}. Attempting reconnect: ${shouldReconnect}`);
-      
-      if (shouldReconnect) {
-        reconnectAttempts++;
-        const backoffDelay = Math.min(6000 * Math.pow(2, reconnectAttempts), 45000);
-        console.log(`🔄 Backing off for ${(backoffDelay / 1000).toFixed(1)} seconds before reconnecting...`);
-        
-        await delay(backoffDelay);
-        startBot();
-      } else {
-        console.error("❌ Bot was permanently logged out of WhatsApp. Clear your session_auth folder/MongoDB to pair again.");
-        process.exit(1);
+    if (reconnecting) return;
+    reconnecting = true;
+    reconnectAttempts++;
+
+    const delayTime = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60000);
+    console.log(`🔄 Reconnecting in ${(delayTime / 1000).toFixed(0)} seconds... (Attempt ${reconnectAttempts})`);
+
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      try {
+        await startBot();
+      } catch (err) {
+        console.error("Reconnection failed:", err);
+        reconnecting = false;
       }
-    } else if (connection === "open") {
-      console.log("\n✅ WHATSAPP BOT ONLINE & OPERATIONAL!");
-      reconnectAttempts = 0; // Reset reconnect backoff
-      await uploadSessionToMongo(authFolder);
+    }, delayTime);
+  }
+
+  if (connection === "open") {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
     }
-  });
+    reconnecting = false;
+    reconnectAttempts = 0;
+    console.log("\n✅ WHATSAPP BOT ONLINE & OPERATIONAL!");
+
+    try {
+      await uploadSessionToMongo(authFolder);
+    } catch (err) {
+      console.error("Failed to upload session:", err);
+    }
+  }
+});
 
   sock.ev.on("creds.update", async () => {
     await saveCreds();
@@ -576,7 +602,9 @@ async function startBot() {
 }
 
 // --- PROTECTION TIER 12: GRACEFUL SHUTDOWN CONNECTIONS TERMINATION ---
+// --- PROTECTION TIER 12: GRACEFUL SHUTDOWN CONNECTIONS TERMINATION ---
 process.on("SIGTERM", async () => {
+  shuttingDown = true; // Activating the guard to prevent reconnection loops
   console.log("👋 [SHUTDOWN] Render is stopping container. Closing database connections gracefully...");
   try {
     await mongoose.connection.close();
