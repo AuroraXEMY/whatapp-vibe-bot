@@ -469,7 +469,7 @@ async function startBot() {
     printQRInTerminal: !usePairingCode,
     logger: pino({ level: "silent" }),
     // --- BYPASS BLACKLIST: Changed browser fingerprint ---
-    browser: ["VibeGuard-New-Session", "Safari", "3.0.0"],
+    browser: ["Windows", "Chrome", "131.0.0.0"],
     syncFullHistory: false,
     markOnlineOnConnect: true,
     connectTimeoutMs: 60000

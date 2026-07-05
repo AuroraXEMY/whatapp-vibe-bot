@@ -302,17 +302,30 @@ async function uploadSessionToMongo(authFolder) {
  */
 async function downloadSessionFromMongo(authFolder) {
   if (!MONGO_URI) return;
+  
   try {
+    // 1. Ensure directory exists
     if (!fs.existsSync(authFolder)) {
       fs.mkdirSync(authFolder, { recursive: true });
     }
+
+    // 2. Check if we should ignore existing sessions to bypass 405 errors
+    if (process.env.FORCE_FRESH_START === "true") {
+      console.log("⚠️ FORCE_FRESH_START enabled: Skipping database sync.");
+      return;
+    }
+
+    // 3. Attempt to find the session
     const record = await Session.findOne({ sessionId: "whatsapp_vibe_bot" });
+    
     if (record) {
       const sessionData = JSON.parse(record.data);
       for (const [file, content] of Object.entries(sessionData)) {
         fs.writeFileSync(path.join(authFolder, file), content);
       }
       console.log("📥 Loaded active login session from MongoDB Atlas!");
+    } else {
+      console.log("✨ No existing session found in DB. Starting fresh.");
     }
   } catch (err) {
     console.error("❌ Failed to load session from MongoDB:", err.message);
