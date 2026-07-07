@@ -1,0 +1,18 @@
+{
+  "name": "whatsapp-vibe-moderator",
+  "version": "2.4.0",
+  "description": "Fun, robust WhatsApp moderator bot powered by Gemini AI and Baileys with separate pairing & keeping-alive",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js & node index.js",
+    "pair": "node pair.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.2",
+    "@google/genai": "^2.4.0",
+    "mongoose": "^8.2.0",
+    "dotenv": "^17.0.0",
+    "pino": "^8.19.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
