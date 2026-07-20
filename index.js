@@ -31,6 +31,7 @@ const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
+const { spawn } = require("child_process");
 const https = require("https");
 require("dotenv").config();
 
@@ -332,6 +333,9 @@ setInterval(() => {
     shutUpStrikes.clear();
     temporaryIgnore.clear();
     todActiveSessions.clear();
+    quoteSessionActive.clear();
+    recentQuotesCache.clear();
+    heavyCommandCooldowns.clear();
     if (global.gc) {
       try {
         global.gc();
@@ -405,6 +409,24 @@ let statsLoadedOnce = false;
 
 const ACTIVE_CONTEXT_CAP = 50;      // per your spec: ~50 messages of active memory, then archive+reset
 const AI_REPLY_COOLDOWN_MS = 4000;  // stops rapid re-tags from burning the AI provider chain's quota
+
+// Anti-spam for heavy/quota-sensitive commands — separate from the general
+// AI_REPLY_COOLDOWN_MS above, which only throttles ONE reply per chat every
+// 4s. This is per-PERSON, per-COMMAND-TYPE, so one person can't burn through
+// a shared, precious resource (ElevenLabs' free tier is only ~10k chars/
+// month total, easily exhausted by rapid-fire .tts) even if they're careful
+// to stay under the general rate limiter. .tts gets the longest cooldown
+// specifically because of that tiny shared quota; the others are lighter,
+// mainly to stop accidental double-taps rather than protect a scarce quota.
+const heavyCommandCooldowns = new Map(); // "senderJid:commandType" -> timestamp until which to block
+const HEAVY_COMMAND_COOLDOWN_MS = { tts: 20000, imagine: 6000, sticker: 6000, search: 8000 };
+function isHeavyCommandCoolingDown(senderJid, type) {
+  return (heavyCommandCooldowns.get(`${senderJid}:${type}`) || 0) > Date.now();
+}
+function setHeavyCommandCooldown(senderJid, type) {
+  heavyCommandCooldowns.set(`${senderJid}:${type}`, Date.now() + (HEAVY_COMMAND_COOLDOWN_MS[type] || 5000));
+}
+
 // Hard cap on how much of any single message ever reaches an AI provider —
 // DM or group. A deliberately huge paste was confirmed to trip a real
 // provider-side rate limit for 50+ minutes; nothing in this file was holding
@@ -747,21 +769,36 @@ function getGroupConfig(jid) {
   return groupConfigCache.get(jid);
 }
 
-async function persistGroupConfig(jid) {
-  if (!MONGO_URI) return;
+// FIX (addresses reports of "a muted/ignored group reverts after a
+// restart"): previously this made exactly ONE attempt and silently
+// swallowed any failure (console-logged only, never retried, never
+// surfaced to the user) — a transient Mongo hiccup during .mute/.ignore
+// meant the command told the user "done!" while the actual write never
+// landed, so a restart before the NEXT unrelated write (which would
+// eventually re-persist it) reverted the setting. Now retries with a short
+// backoff and returns whether it ultimately succeeded, so mute/ignore/
+// undoignore specifically (the safety/annoyance-critical ones) can warn
+// honestly instead of always claiming unconditional success.
+async function persistGroupConfig(jid, retries = 2) {
+  if (!MONGO_URI) return true; // nothing to persist to — not a failure, just a no-op
   const cfg = getGroupConfig(jid);
-  try {
-    await GroupConfig.findOneAndUpdate(
-      { jid },
-      {
-        locked: cfg.locked, lastRecapDate: cfg.lastRecapDate, mood: cfg.mood, muted: cfg.muted, ignoredUsers: cfg.ignoredUsers,
-        movieModeEnabled: cfg.movieModeEnabled, newsletterEnabled: cfg.newsletterEnabled, lastNewspaperDate: cfg.lastNewspaperDate
-      },
-      { upsert: true }
-    );
-  } catch (err) {
-    console.error(`❌ Failed persisting group config for ${jid}:`, err.message);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      await GroupConfig.findOneAndUpdate(
+        { jid },
+        {
+          locked: cfg.locked, lastRecapDate: cfg.lastRecapDate, mood: cfg.mood, muted: cfg.muted, ignoredUsers: cfg.ignoredUsers,
+          movieModeEnabled: cfg.movieModeEnabled, newsletterEnabled: cfg.newsletterEnabled, lastNewspaperDate: cfg.lastNewspaperDate
+        },
+        { upsert: true }
+      );
+      return true;
+    } catch (err) {
+      console.error(`❌ Failed persisting group config for ${jid} (attempt ${attempt + 1}/${retries + 1}):`, err.message);
+      if (attempt < retries) await delay(500 * (attempt + 1)); // brief backoff before retrying
+    }
   }
+  return false;
 }
 
 async function loadGroupConfigsFromMongo() {
@@ -807,6 +844,17 @@ async function loadGroupConfigsFromMongo() {
   }
 }
 
+// TIGHTENING: document and video placeholders ("[file: report.pdf]",
+// "[video, no caption]") never carry any analyzable content — this bot
+// doesn't process document or video content at all, no matter how they
+// arrive — so storing them in the active buffer (and eventually the
+// archive) is pure noise with zero value for context/summary/Daily-
+// Newspaper purposes. Skipped entirely rather than stored. Images/
+// stickers/voice-notes are deliberately NOT skipped here — those DO carry
+// real signal (a vision/transcription result, or at minimum "someone
+// shared something" worth a Daily Newspaper mention).
+const NOISE_PLACEHOLDER_REGEX = /^\[(video, no caption|file(: .+)?)\]$/;
+
 // Active conversational memory: holds the last ACTIVE_CONTEXT_CAP text
 // messages per group. Feeds AI chat replies with real context AND doubles as
 // Movie Mode's source. Once it hits the cap, the whole buffer is archived to
@@ -814,6 +862,7 @@ async function loadGroupConfigsFromMongo() {
 // lost, and the AI always has a fresh, relevant window instead of stale
 // months-old context.
 async function bufferGroupMessage(jid, sender, text) {
+  if (NOISE_PLACEHOLDER_REGEX.test(text)) return; // never store zero-value document/video placeholders
   if (!groupMessageBuffers.has(jid)) groupMessageBuffers.set(jid, []);
   const buf = groupMessageBuffers.get(jid);
   buf.push({ sender, text: text.slice(0, 200), ts: Date.now() }); // truncate per-message to bound memory
@@ -1221,8 +1270,9 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
       if (cmd === ".mute") {
         cfg.muted = true;
         cfg.dirty = true;
-        await persistGroupConfig(jid);
-        await sock.sendMessage(jid, { text: "😴 Going quiet — I won't react, comment, or reply to anything here until *.unmute*." }, { quoted: msg });
+        const persisted = await persistGroupConfig(jid);
+        const warning = persisted ? "" : "\n\n⚠️ Heads up: I couldn't confirm this saved to the database after a few tries — if I restart before it syncs, this might not stick. Worth double-checking with *.settings* in a bit.";
+        await sock.sendMessage(jid, { text: "😴 Going quiet — I won't react, comment, or reply to anything here until *.unmute*." + warning }, { quoted: msg });
       } else {
         cfg.muted = false;
         cfg.dirty = true;
@@ -1308,8 +1358,9 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
       const cfg = getGroupConfig(jid);
       if (!isJidInList(cfg.ignoredUsers, target)) cfg.ignoredUsers.push(target);
       cfg.dirty = true;
-      await persistGroupConfig(jid);
-      await sock.sendMessage(jid, { text: `🔇 Ignoring @${target.split("@")[0]} in this group from now on — no replies, no reactions, nothing, until *.undoignore*.`, mentions: [target] });
+      const persisted = await persistGroupConfig(jid);
+      const ignoreWarning = persisted ? "" : "\n\n⚠️ Couldn't confirm this saved to the database after a few tries — worth double-checking with *.ignorelist* in a bit.";
+      await sock.sendMessage(jid, { text: `🔇 Ignoring @${target.split("@")[0]} in this group from now on — no replies, no reactions, nothing, until *.undoignore*.${ignoreWarning}`, mentions: [target] });
       return true;
     }
 
@@ -1406,6 +1457,11 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
         await sock.sendMessage(jid, { text: "🔎 Web search isn't set up yet — my developer needs to add TAVILY_API_KEY." }, { quoted: msg });
         return true;
       }
+      if (isHeavyCommandCoolingDown(senderJid, "search")) {
+        await sock.sendMessage(jid, { text: "😅 One search at a time — give me a few seconds." }, { quoted: msg });
+        return true;
+      }
+      setHeavyCommandCooldown(senderJid, "search");
       await sock.sendMessage(jid, { text: randomFiller("search") }, { quoted: msg });
       try {
         const result = await runHeavyTask(() => searchWeb(query));
@@ -1431,18 +1487,23 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
         await sock.sendMessage(jid, { text: "🎨 Usage: *.imagine <what you want to see>*" }, { quoted: msg });
         return true;
       }
+      if (isHeavyCommandCoolingDown(senderJid, "imagine")) {
+        await sock.sendMessage(jid, { text: "😅 One image at a time — give me a few seconds between requests." }, { quoted: msg });
+        return true;
+      }
+      setHeavyCommandCooldown(senderJid, "imagine");
       await sock.sendMessage(jid, { text: randomFiller("image") }, { quoted: msg });
       try {
         await runHeavyTask(async () => {
-          const url = buildImagineUrl(prompt);
-          // Baileys downloads/uploads the image itself from the URL — this
-          // never touches our own RAM at all, the safest possible path.
-          await sock.sendMessage(jid, { image: { url }, caption: `🎨 *${prompt}*` }, { quoted: msg });
+          const imageBuffer = await generateAndValidateImage(prompt);
+          await sock.sendMessage(jid, { image: imageBuffer, caption: `🎨 *${prompt}*` }, { quoted: msg });
         });
+        console.log(`✅ [IMAGINE] Sent generated image for "${prompt.slice(0, 60)}".`);
       } catch (err) {
         const failText = err.message === "HEAVY_QUEUE_FULL"
           ? "😅 I'm pretty swamped right now — give me a minute and try generating that again?"
           : "🎨 Something went wrong generating that image — try again, maybe with a simpler prompt?";
+        console.error(`❌ [IMAGINE] Failed for "${prompt.slice(0, 60)}": ${err.message}`);
         await sock.sendMessage(jid, { text: failText }, { quoted: msg }).catch(() => {});
       }
       return true;
@@ -1466,30 +1527,50 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
 
     if (cmd === ".quote") {
       const vibeForCmd = jid.endsWith("@g.us") ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
-      const { quote, author } = await generateQuote(vibeForCmd);
+      startQuoteSession(jid);
+      const { quote, author } = await generateQuote(vibeForCmd, jid);
       await sock.sendMessage(jid, { text: author ? `"${quote}"\n— ${author}` : `"${quote}"` }, { quoted: msg });
       return true;
     }
 
     if (cmd === ".eli5" || cmd.startsWith(".eli5 ")) {
       const topic = text.trim().slice(".eli5".length).trim();
-      if (!topic) {
-        await sock.sendMessage(jid, { text: "🧠 Usage: *.eli5 <topic>* — e.g. *.eli5 black holes*" }, { quoted: msg });
+      const quotedMediaTypeForEli5 = getQuotedMediaType(msg.message);
+      const quotedTextForEli5 = getQuotedMessageText(msg.message);
+      const hasQuotedContent = !!(quotedMediaTypeForEli5 || quotedTextForEli5);
+
+      if (!topic && !hasQuotedContent) {
+        await sock.sendMessage(jid, { text: "🧠 Usage: *.eli5 <topic>* — e.g. *.eli5 black holes* — or reply to an image/voice note/link with *.eli5* and I'll explain THAT simply." }, { quoted: msg });
         return true;
       }
+
       const vibeForCmd = jid.endsWith("@g.us") ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
       let searchContext = "";
-      if (TAVILY_KEYS.length > 0 && NEWSY_QUERY_REGEX.test(topic)) {
-        // Only bothers searching for clearly current-events-flavored topics
-        // ("latest", "current", etc.) — most ELI5 topics are timeless
-        // concepts the model already knows well, so this avoids burning
-        // search quota on "eli5 photosynthesis"-type requests.
+      let additionalContext = "";
+
+      if (hasQuotedContent) {
+        // Reply to an image/voice-note/link + .eli5 — reuse the same
+        // shared gatherer the combined analyzer and .tts use (vision,
+        // transcription, domain-based search, all in one place).
+        await sock.sendMessage(jid, { text: randomFiller("analyze") }, { quoted: msg }).catch(() => {});
+        const gathered = await gatherQuotedContext(jid, msg);
+        additionalContext = gathered.enrichedContextText || "";
+        searchContext = gathered.searchContext;
+      }
+
+      // Typed-topic auto-search only kicks in if the quoted-content search
+      // above didn't already ground the answer, and only for clearly
+      // current-events-flavored topics — most ELI5 topics are timeless
+      // concepts the model already knows well, so this avoids burning
+      // search quota on "eli5 photosynthesis"-type requests.
+      if (!searchContext && topic && TAVILY_KEYS.length > 0 && NEWSY_QUERY_REGEX.test(topic)) {
         try {
           const searchResult = await runHeavyTask(() => searchWeb(topic));
           if (searchResult.success && searchResult.results) searchContext = searchResult.results.slice(0, 2000);
         } catch (err) { /* proceed without grounding rather than block the explanation */ }
       }
-      const explanation = await generateEli5Explanation(topic, vibeForCmd, searchContext);
+
+      const explanation = await generateEli5Explanation(topic || "this", vibeForCmd, searchContext, additionalContext);
       await sock.sendMessage(jid, { text: explanation }, { quoted: msg });
       return true;
     }
@@ -1505,6 +1586,11 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
         await sock.sendMessage(jid, { text: "🖼️ Sticker-making needs a small optional piece my developer hasn't installed yet — poke them about adding `sharp`!" }, { quoted: msg });
         return true;
       }
+      if (isHeavyCommandCoolingDown(senderJid, "sticker")) {
+        await sock.sendMessage(jid, { text: "😅 One sticker at a time — give me a few seconds." }, { quoted: msg });
+        return true;
+      }
+      setHeavyCommandCooldown(senderJid, "sticker");
       try {
         await runHeavyTask(async () => {
           const rawBuffer = await downloadQuotedMedia(jid, msg.message);
@@ -1531,43 +1617,33 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
     }
 
     if (cmd === ".tts" || cmd.startsWith(".tts ")) {
+      if (isHeavyCommandCoolingDown(senderJid, "tts")) {
+        await sock.sendMessage(jid, { text: "😅 One voice note at a time — give me about 20 seconds between *.tts* requests." }, { quoted: msg });
+        return true;
+      }
+      setHeavyCommandCooldown(senderJid, "tts");
       const question = text.trim().slice(".tts".length).trim() || "Explain this.";
       const vibeForCmd = jid.endsWith("@g.us") ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
       await sock.sendMessage(jid, { text: randomFiller("tts") }, { quoted: msg }).catch(() => {});
 
       try {
-        const quotedMediaTypeForTts = getQuotedMediaType(msg.message);
         const context = getRecentContext(jid);
-        let aiResult;
-
-        if (quotedMediaTypeForTts === "image" || quotedMediaTypeForTts === "sticker") {
-          // Reply to an image/sticker + .tts explain — reuse the exact same
-          // combined image+text+link analyzer the natural-language flow
-          // uses, so .tts gets identical quality/grounding, just spoken.
-          aiResult = await analyzeQuotedMediaAndText(senderJid, sender, question, vibeForCmd, context, false, jid, msg);
-        } else if (quotedMediaTypeForTts === "audio") {
-          const audioBuffer = await runHeavyTask(() => downloadQuotedMedia(jid, msg.message));
-          if (audioBuffer) {
-            const transcription = await runHeavyTask(() => transcribeAudioWithGroq(audioBuffer, "audio/ogg"));
-            const quotedAudioText = transcription.success && transcription.text ? `Original voice note said: "${transcription.text}"` : null;
-            aiResult = await generateAIChatReply(senderJid, sender, question, vibeForCmd, context, quotedAudioText, false, "", jid);
-          } else {
-            aiResult = { success: false, message: "🎙️ Couldn't grab that voice note cleanly — try replying to it again?" };
-          }
-        } else {
-          // Plain text reply (which may itself contain a link/phone number)
-          // or no reply at all — same auto-search behavior normal chat
-          // already has, so .tts never holds back on grounding either.
-          let searchContext = "";
-          if (shouldAutoSearch(question, vibeForCmd)) {
-            try {
-              const searchResult = await runHeavyTask(() => searchWeb(question));
-              if (searchResult.success && searchResult.results) searchContext = searchResult.results.slice(0, 2500);
-            } catch (err) { /* proceed without grounding rather than block the explanation */ }
-          }
-          const quotedTextForTts = getQuotedMessageText(msg.message);
-          aiResult = await generateAIChatReply(senderJid, sender, question, vibeForCmd, context, quotedTextForTts, false, searchContext, jid);
+        // Unified path for ANY quoted content (image/sticker/audio/text/
+        // link) via the shared gatherer — replacing three separate
+        // branches that used to duplicate transcription/link-detection
+        // logic. Also layers in question-based auto-search (same trigger
+        // normal chat replies use) on top of any quoted-link search, so
+        // .tts never holds back on grounding either way.
+        const gathered = await gatherQuotedContext(jid, msg);
+        let combinedSearchContext = gathered.searchContext;
+        if (!combinedSearchContext && shouldAutoSearch(question, vibeForCmd)) {
+          try {
+            const searchResult = await runHeavyTask(() => searchWeb(question));
+            if (searchResult.success && searchResult.results) combinedSearchContext = searchResult.results.slice(0, 2500);
+          } catch (err) { /* proceed without grounding rather than block the explanation */ }
         }
+
+        const aiResult = await generateAIChatReply(senderJid, sender, question, vibeForCmd, context, gathered.enrichedContextText, false, combinedSearchContext, jid);
 
         if (!aiResult.success) {
           await sock.sendMessage(jid, { text: aiResult.message }, { quoted: msg });
@@ -1576,7 +1652,12 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
 
         const speech = await runHeavyTask(() => generateSpeechAudio(aiResult.message));
         if (speech.success) {
-          await sendMessageWithTimeout(sock, jid, { audio: speech.buffer, mimetype: speech.mimeType, ptt: true }, { quoted: msg });
+          // FIX (confirmed bug): always claiming ptt:true regardless of
+          // actual encoding is what caused WhatsApp to reject the audio as
+          // corrupt. isVoiceNote is only true when generateSpeechAudio
+          // actually produced real OGG/Opus via ffmpeg — otherwise this
+          // sends as a normal, completely playable audio attachment.
+          await sendMessageWithTimeout(sock, jid, { audio: speech.buffer, mimetype: speech.mimeType, ptt: speech.isVoiceNote }, { quoted: msg });
           if (jid.endsWith("@g.us")) getGroupConfig(jid).responsesSent++;
         } else {
           // Never leave the person with nothing — text fallback if TTS
@@ -1656,16 +1737,33 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
   return false; // not a recognized command — fall through to normal handling
 }
 
+// Extra defense-in-depth for the "muted/ignored group reverts after a
+// restart" report, on top of persistGroupConfig's own retry logic above:
+// periodically re-confirms that any group CURRENTLY muted or with ignored
+// users is actually saved in Mongo, not just sitting correctly in the
+// in-memory cache. Cheap in practice — most groups have neither set, so
+// this is normally a no-op scan over a small in-memory Map, not a Mongo
+// write per group.
+async function reverifyMuteAndIgnorePersistence() {
+  if (!MONGO_URI) return;
+  for (const [jid, cfg] of groupConfigCache.entries()) {
+    if (cfg.muted || cfg.ignoredUsers.length > 0) {
+      await persistGroupConfig(jid);
+    }
+  }
+}
+
 // Runs independent of connection state — checks every 10 min whether it's
-// time for a Movie Mode recap or Daily Newspaper, and flushes any dirty
-// XP/fact/activity changes to Mongo. Lives at module scope (not inside
-// startBot()) so it's created exactly once regardless of how many times the
-// socket reconnects.
+// time for a Movie Mode recap or Daily Newspaper, flushes any dirty
+// XP/fact/activity changes to Mongo, and re-confirms mute/ignore state is
+// actually saved. Lives at module scope (not inside startBot()) so it's
+// created exactly once regardless of how many times the socket reconnects.
 setInterval(async () => {
   try {
     await flushUserStatsToMongo();
     await flushUserFactsToMongo();
     await flushActivityLogToMongo();
+    await reverifyMuteAndIgnorePersistence();
     await maybeGenerateMovieRecap(currentSock);
     await maybeGenerateDailyNewspaper(currentSock);
   } catch (err) {
@@ -1708,12 +1806,37 @@ const SessionSchema = new mongoose.Schema({
 const Session = mongoose.models.Session || mongoose.model("Session", SessionSchema);
 
 // --- Lightweight gamification & memory schemas (all best-effort, non-critical) ---
+//
+// MongoDB retention policy across every collection in this file, decided
+// together rather than piecemeal (you asked "you decide!" — here's the
+// reasoning, so a future maintainer doesn't have to re-derive it):
+// - UserChatFacts: 30-day TTL (unchanged, already correct) — a "fact"
+//   genuinely goes stale; no reason to remember something from months ago.
+// - ConversationArchive: 30-day TTL (unchanged, already correct) — a dump
+//   of old chat history has fast-diminishing value once it's no longer
+//   recent, and nothing in this bot ever reads it back in anyway.
+// - ActivityLog: 8-day TTL (unchanged, already correct) — .activity only
+//   ever looks at the last 7 days, so 8 is exactly enough buffer.
+// - Session: NO TTL, and this is correct, not an oversight — this is the
+//   live WhatsApp login. Expiring it would log the bot out.
+// - GroupConfig: NO TTL, and this is correct, not an oversight — mood/
+//   mute/ignore-list/toggles are ACTIVE CONFIGURATION, not accumulating
+//   junk data. A group that's quiet for a few months shouldn't silently
+//   lose its custom settings, and the data size here (one small doc per
+//   group) is trivial regardless of how long between messages.
+// - UserStat: NEW — a generous 1-YEAR inactivity TTL added below. XP/rank
+//   is meant to be a lasting achievement (that's the whole point of a
+//   level system), so this is deliberately NOT the same aggressive 30-day
+//   window as facts/archives — 1 year is long enough that it will never
+//   affect anyone actually using the bot with any real regularity, while
+//   still providing a genuine bound against truly-abandoned entries
+//   accumulating forever if this bot ever scales to many more users later.
 const UserStatSchema = new mongoose.Schema({
   jid: { type: String, required: true, unique: true },
   displayName: String,
   xp: { type: Number, default: 0 },
   messageCount: { type: Number, default: 0 },
-  lastActive: Date
+  lastActive: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 365 }
 });
 const UserStat = mongoose.models.UserStat || mongoose.model("UserStat", UserStatSchema);
 
@@ -1851,7 +1974,18 @@ const BASELINE_TONE_RULES = `Baseline tone rules — apply to every mood except 
 const PROVIDER_DEFS = [
   { envBase: "GROQ_API_KEY", name: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
   { envBase: "CEREBRAS_API_KEY", name: "Cerebras", baseUrl: "https://api.cerebras.ai/v1", model: "llama-3.3-70b" },
-  { envBase: "GEMINI_API_KEY", name: "Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
+  // FIX (confirmed in production, July 2026): gemini-2.5-flash started
+  // returning hard 404s ("no longer available") for many accounts well
+  // ahead of its official Oct 16 2026 retirement date — Google's Gemini
+  // model retirement cadence has been aggressive (2.0 already fully dead,
+  // 2.5 mid-retirement). Pinning to a specific version string means this
+  // breaks again on the NEXT retirement too. Using "gemini-flash-latest"
+  // instead — Google's own auto-updating alias that always points at
+  // whichever flash model is current-stable, specifically designed so
+  // integrations don't need a code change every time Google retires a
+  // version. If Gemini ever fails outright again, this is the first thing
+  // to check — but this alias should absorb future churn automatically.
+  { envBase: "GEMINI_API_KEY", name: "Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-flash-latest" },
   { envBase: "OPENROUTER_API_KEY", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "meta-llama/llama-3.3-70b-instruct:free" },
   { envBase: "MISTRAL_API_KEY", name: "Mistral", baseUrl: "https://api.mistral.ai/v1", model: "mistral-small-latest" }
 ];
@@ -1892,8 +2026,21 @@ const GEMINI_VISION_KEYS = collectProviderKeys("GEMINI_API_KEY"); // reuses the 
 // best-effort only). If BOTH fail, .tts falls back to plain text rather
 // than leaving the person with nothing. Fully optional: with zero
 // ELEVENLABS_API_KEY configured, .tts still works via StreamElements alone.
+//
+// FIX (confirmed in production): ElevenLabs returned "Free users cannot use
+// library voices via the API. Please upgrade your subscription to use this
+// voice." — this means a FREE ElevenLabs account can only use voices IT
+// OWNS (custom-cloned or voice-designed in its own dashboard), never the
+// shared premade/"library" voices like "Rachel", even via API. There's no
+// way around this except creating a real custom voice — so ELEVENLABS_VOICE_ID
+// is no longer hardcoded to a library voice; if unset, generateSpeechAudio()
+// below resolves it dynamically via GET /v1/voices, which only ever returns
+// voices the account actually has access to (custom ones on a free plan).
+// If the account has none yet, ElevenLabs is skipped in favor of
+// StreamElements/text — see generateSpeechAudio() for the actual logic and
+// the ACTION REQUIRED note on how to create a usable voice.
 const ELEVENLABS_KEYS = collectProviderKeys("ELEVENLABS_API_KEY");
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // "Rachel" — one of ElevenLabs' default pre-made voices, available on the free tier
+const ELEVENLABS_VOICE_ID_OVERRIDE = process.env.ELEVENLABS_VOICE_ID || null; // optional — pins a specific voice instead of auto-resolving
 console.log(`🔎 [WEB SEARCH] ${TAVILY_KEYS.length > 0 ? `${TAVILY_KEYS.length} Tavily key(s) configured` : "⚠️ No TAVILY_API_KEY — .search disabled"}`);
 console.log(`👁️ [VISION] ${GEMINI_VISION_KEYS.length > 0 ? "Gemini vision available" : "⚠️ No GEMINI_API_KEY — image/sticker understanding disabled"}`);
 console.log(`🎙️ [TTS] ${ELEVENLABS_KEYS.length > 0 ? `${ELEVENLABS_KEYS.length} ElevenLabs key(s) configured (+ StreamElements fallback)` : "No ELEVENLABS_API_KEY — .tts will use the free StreamElements fallback only"}`);
@@ -1944,12 +2091,43 @@ async function searchWeb(query) {
   return { success: false, results: null };
 }
 
-// --- Image generation via Pollinations.ai — no API key needed at all, and no
-// binary handling on our end either: we hand Baileys the URL directly and it
-// downloads/uploads to WhatsApp itself, so this never touches our own RAM.
+// --- Image generation via Pollinations.ai — no API key needed at all.
 function buildImagineUrl(prompt) {
   const seed = Math.floor(Math.random() * 1000000); // avoids getting a cached/identical image for repeated prompts
   return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=768&height=768&seed=${seed}&nologo=true`;
+}
+
+// FIX (confirmed bug — "image gen seems broken, no error shown anywhere"):
+// the original version handed Baileys the raw URL directly and let IT
+// fetch/upload the image, which meant a failed generation (Pollinations
+// returning an error page, a truncated/empty body, or just being slow that
+// moment) had NO logging and NO clear user-facing error — it just silently
+// produced nothing. This now fetches and VALIDATES the image ourselves
+// first (real content-type, real non-trivial byte size) before ever
+// handing it to Baileys, and logs success/failure explicitly either way.
+// This does mean the image briefly passes through our own memory now
+// (a few hundred KB typically, released immediately after send) rather
+// than never touching our RAM at all — a small, worthwhile trade for
+// actually being able to tell what happened when it fails.
+async function generateAndValidateImage(prompt) {
+  const url = buildImagineUrl(prompt);
+  const response = await fetchWithTimeout(url, {}, 30000); // Pollinations can genuinely take a while to render
+  if (!response.ok) {
+    throw new Error(`Pollinations returned HTTP ${response.status}`);
+  }
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.startsWith("image/")) {
+    throw new Error(`Pollinations returned non-image content-type: "${contentType}" (likely an error page, not an image)`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length < 1000) {
+    throw new Error(`Pollinations returned a suspiciously small "image" (${buffer.length} bytes) — treating as a failure`);
+  }
+  if (buffer.length > MAX_MEDIA_BYTES) {
+    throw new Error(`Generated image was unexpectedly huge (${(buffer.length / 1024 / 1024).toFixed(1)}MB) — refusing to send`);
+  }
+  return buffer;
 }
 
 // --- Image/sticker recognition — Gemini ONLY (not the full chat chain, per
@@ -1969,7 +2147,7 @@ async function analyzeImageWithGemini(base64Image, mimeType, question) {
   // as a vision replacement down the line.
   const attempts = [];
   for (const key of GEMINI_VISION_KEYS) {
-    attempts.push({ provider: "Gemini", key, url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", model: "gemini-2.5-flash" });
+    attempts.push({ provider: "Gemini", key, url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", model: "gemini-flash-latest" }); // see PROVIDER_DEFS comment above — auto-updating alias, avoids the exact 404 already hit in production
   }
   for (const key of collectProviderKeys("OPENROUTER_API_KEY")) {
     attempts.push({ provider: "OpenRouter", key, url: "https://openrouter.ai/api/v1/chat/completions", model: "google/gemma-4-31b-it:free" });
@@ -2071,13 +2249,143 @@ async function transcribeAudioWithGroq(audioBuffer, mimeType) {
 // most WhatsApp clients render as a voice-note-style bubble in practice
 // even for non-opus audio) — just don't expect a guaranteed pixel-perfect
 // native waveform bubble on every client version.
+// --- Optional ffmpeg-based OGG/Opus transcoding for real WhatsApp voice
+// notes. FIX (confirmed in production — "WhatsApp says something is wrong
+// with the Audio"): WhatsApp voice notes genuinely require real OGG/Opus
+// encoding; sending an mp3 file with ptt:true does NOT reliably work,
+// contrary to what was assumed earlier — multiple independent reports
+// confirm WhatsApp either fails to play it or shows a corrupt-media error.
+// `ffmpeg-static` bundles a prebuilt ffmpeg binary as a plain npm
+// dependency (same mechanism as `sharp` bundling libvips — no system-level
+// apt-get/install needed, works on Render's standard build). Fully
+// optional: lazily loaded, fails closed exactly like sharp — if it's not
+// installed, generateSpeechAudio() below falls back to sending a REGULAR
+// (non-voice-note-styled) audio attachment instead, which WhatsApp plays
+// completely fine, rather than the confirmed-broken mp3+ptt combination.
+let ffmpegBinaryPath = null;
+let ffmpegLoadAttempted = false;
+function getFfmpegPath() {
+  if (!ffmpegLoadAttempted) {
+    ffmpegLoadAttempted = true;
+    try {
+      ffmpegBinaryPath = require("ffmpeg-static");
+      if (!ffmpegBinaryPath) throw new Error("ffmpeg-static resolved to no binary for this platform");
+      console.log(`🎬 [FFMPEG] ffmpeg-static available — TTS audio will be transcoded to real OGG/Opus for proper WhatsApp voice notes.`);
+    } catch (e) {
+      console.warn("⚠️ [FFMPEG] `ffmpeg-static` isn't installed — .tts will send a regular playable audio file instead of a voice-note bubble (WhatsApp voice notes require real OGG/Opus, which needs ffmpeg to produce). Run `npm install ffmpeg-static` to enable proper voice notes. Everything else works fine without it.");
+      ffmpegBinaryPath = null;
+    }
+  }
+  return ffmpegBinaryPath;
+}
+
+// Transcodes an arbitrary audio buffer (mp3, whatever) to WhatsApp-correct
+// OGG/Opus entirely in memory via stdin/stdout piping — never touches disk,
+// consistent with every other media-handling function in this file. Has
+// its own hard timeout independent of runHeavyTask's, since a hung child
+// process needs to be forcibly killed, not just abandoned.
+async function transcodeToOggOpus(inputBuffer, timeoutMs = 15000) {
+  const ffmpeg = getFfmpegPath();
+  if (!ffmpeg) return null;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const proc = spawn(ffmpeg, [
+      "-loglevel", "error",
+      "-i", "pipe:0",
+      "-vn",
+      "-ar", "48000",
+      "-ac", "1",
+      "-c:a", "libopus",
+      "-b:a", "64k",
+      "-f", "ogg",
+      "pipe:1"
+    ]);
+
+    const outChunks = [];
+    const errChunks = [];
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      proc.kill("SIGKILL");
+      reject(new Error("FFMPEG_TIMEOUT"));
+    }, timeoutMs);
+
+    proc.stdout.on("data", (chunk) => outChunks.push(chunk));
+    proc.stderr.on("data", (chunk) => errChunks.push(chunk));
+    proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0 && outChunks.length > 0) {
+        resolve(Buffer.concat(outChunks));
+      } else {
+        reject(new Error(`ffmpeg exited with code ${code}: ${Buffer.concat(errChunks).toString().slice(0, 300)}`));
+      }
+    });
+
+    proc.stdin.on("error", () => {}); // avoid an unhandled EPIPE if the process dies before we finish writing
+    proc.stdin.write(inputBuffer);
+    proc.stdin.end();
+  });
+}
+
 const TTS_MAX_CHARS = 600; // keeps voice notes snappy and protects ElevenLabs' small free-tier quota
+
+// FIX (confirmed in production): ElevenLabs free accounts can ONLY use
+// voices the account actually owns (custom-cloned or voice-designed) via
+// the API — never shared "library"/premade voices, even ones like "Rachel"
+// that are freely usable in the ElevenLabs web app. Hardcoding a library
+// voice ID always fails with 402 payment_required on a free plan. This
+// resolves the account's OWN first available voice at runtime instead —
+// cached per key after the first successful lookup so it's not re-fetched
+// on every single TTS call. If ELEVENLABS_VOICE_ID is explicitly set, that
+// always wins (lets you pin a specific voice once you've created one).
+const resolvedVoiceIdCache = new Map(); // apiKey -> voiceId
+async function resolveElevenLabsVoiceId(key) {
+  if (ELEVENLABS_VOICE_ID_OVERRIDE) return ELEVENLABS_VOICE_ID_OVERRIDE;
+  if (resolvedVoiceIdCache.has(key)) return resolvedVoiceIdCache.get(key);
+
+  const response = await fetchWithTimeout("https://api.elevenlabs.io/v1/voices", {
+    headers: { "xi-api-key": key }
+  }, 10000);
+  if (!response.ok) {
+    throw new Error(`Couldn't list voices for this key (HTTP ${response.status})`);
+  }
+  const data = await response.json();
+  const voices = data.voices || [];
+  if (voices.length === 0) {
+    // ACTION REQUIRED (this is the fix for the confirmed 402 error): a free
+    // ElevenLabs account starts with ZERO owned voices, so there's nothing
+    // usable via API yet. Create one at elevenlabs.io → Voices → either
+    // "Voice Cloning" (upload/record a short sample) or "Voice Design"
+    // (generate one from a text description) — either works on the free
+    // plan and produces a voice ID this function will then pick up
+    // automatically, no code change needed.
+    throw new Error("This ElevenLabs account has no custom voices yet — free accounts can't use library voices via the API. Create one at elevenlabs.io (Voice Cloning or Voice Design both work on the free plan).");
+  }
+  // Prefer a genuinely owned/custom voice over anything flagged as premade,
+  // in case the account somehow has both listed.
+  const preferred = voices.find(v => v.category && v.category !== "premade") || voices[0];
+  resolvedVoiceIdCache.set(key, preferred.voice_id);
+  return preferred.voice_id;
+}
+
 async function generateSpeechAudio(text) {
   const trimmed = text.length > TTS_MAX_CHARS ? text.slice(0, TTS_MAX_CHARS) + "..." : text;
+  let rawResult = null; // {buffer, mimeType} from whichever provider succeeds first
 
   for (const key of ELEVENLABS_KEYS) {
     try {
-      const response = await fetchWithTimeout(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+      const voiceId = await resolveElevenLabsVoiceId(key);
+      const response = await fetchWithTimeout(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "xi-api-key": key, "Accept": "audio/mpeg" },
         body: JSON.stringify({ text: trimmed, model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
@@ -2088,32 +2396,67 @@ async function generateSpeechAudio(text) {
       }
       const arrayBuffer = await response.arrayBuffer();
       console.log("✅ [TTS] ElevenLabs succeeded.");
-      return { success: true, buffer: Buffer.from(arrayBuffer), mimeType: "audio/mpeg" };
+      rawResult = { buffer: Buffer.from(arrayBuffer), mimeType: "audio/mpeg" };
+      break;
     } catch (err) {
       console.warn(`⚠️ [TTS] ElevenLabs key failed: ${err.message}`);
       continue;
     }
   }
 
-  // StreamElements — free, keyless, always available. Unofficial/
-  // undocumented, so treated as a best-effort fallback only, not a primary
-  // dependency: if it fails too, the caller falls back to plain text.
-  try {
-    const url = `https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(trimmed)}`;
-    const response = await fetchWithTimeout(url, { method: "GET" }, 15000);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const arrayBuffer = await response.arrayBuffer();
-    // A failed/empty StreamElements response often comes back as a tiny
-    // body rather than a clean HTTP error — guard against "succeeding"
-    // with near-empty/broken audio.
-    if (!arrayBuffer || arrayBuffer.byteLength < 100) throw new Error("EMPTY_AUDIO_RESPONSE");
-    console.log("✅ [TTS] StreamElements (fallback) succeeded.");
-    return { success: true, buffer: Buffer.from(arrayBuffer), mimeType: "audio/mpeg" };
-  } catch (err) {
-    console.warn(`⚠️ [TTS] StreamElements fallback failed: ${err.message}`);
+  if (!rawResult) {
+    // StreamElements — free, keyless, always available in principle.
+    // Confirmed unofficial/undocumented in practice too: it started
+    // returning HTTP 401 in production for reasons the (unofficial,
+    // sparse) docs don't explain — logging the actual response body now
+    // instead of just the status code, so if this happens again the real
+    // reason is visible in the console rather than a bare "401". Treated
+    // purely as best-effort: if it fails, the caller falls back to plain
+    // text rather than nothing.
+    try {
+      const url = `https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(trimmed)}`;
+      const response = await fetchWithTimeout(url, {
+        method: "GET",
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; NaylaBot/1.0)" } // some unofficial endpoints reject requests with no browser-like UA at all
+      }, 15000);
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "(couldn't read error body)");
+        throw new Error(`HTTP ${response.status} — ${errorBody.slice(0, 200)}`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      // A failed/empty StreamElements response often comes back as a tiny
+      // body rather than a clean HTTP error — guard against "succeeding"
+      // with near-empty/broken audio.
+      if (!arrayBuffer || arrayBuffer.byteLength < 100) throw new Error("EMPTY_AUDIO_RESPONSE");
+      console.log("✅ [TTS] StreamElements (fallback) succeeded.");
+      rawResult = { buffer: Buffer.from(arrayBuffer), mimeType: "audio/mpeg" };
+    } catch (err) {
+      console.warn(`⚠️ [TTS] StreamElements fallback failed: ${err.message}`);
+    }
   }
 
-  return { success: false, buffer: null, mimeType: null };
+  if (!rawResult) {
+    return { success: false, buffer: null, mimeType: null, isVoiceNote: false };
+  }
+
+  // FIX (confirmed in production — "WhatsApp says something is wrong with
+  // the Audio"): WhatsApp voice notes require REAL OGG/Opus encoding, not
+  // just an mp3 file labeled ptt:true. Transcode via the optional
+  // ffmpeg-static binary if available; if not, fall back to sending as a
+  // REGULAR (non-voice-note) audio attachment instead — which WhatsApp
+  // plays completely fine — never ptt:true with unconverted mp3 again,
+  // since that combination is now confirmed broken.
+  try {
+    const oggBuffer = await transcodeToOggOpus(rawResult.buffer);
+    if (oggBuffer) {
+      console.log("✅ [TTS] Transcoded to real OGG/Opus for a proper WhatsApp voice note.");
+      return { success: true, buffer: oggBuffer, mimeType: "audio/ogg; codecs=opus", isVoiceNote: true };
+    }
+  } catch (err) {
+    console.warn("⚠️ [TTS] ffmpeg transcoding failed, falling back to a regular audio attachment:", err.message);
+  }
+
+  return { success: true, buffer: rawResult.buffer, mimeType: rawResult.mimeType, isVoiceNote: false };
 }
 
 
@@ -2303,6 +2646,28 @@ function isDarePick(text, jid) {
 // Natural quote request — "gimme a quote", "quote of the day", "inspire me".
 const QUOTE_REQUEST_REGEX = /\b(gimme|give me|got|share|drop) (me )?a quote\b|\bquote of the day\b|\binspire me\b|\bsay something (deep|wise|inspiring|profound)\b/i;
 
+// FIX (confirmed bug — the SAME quote repeating verbatim, inconsistent
+// formatting): a natural follow-up like "new one" / "another one" / "NEW
+// ONE!" didn't match QUOTE_REQUEST_REGEX at all, so it fell through to the
+// generic chat-reply path — which has NO knowledge of generateQuote()'s
+// anti-repetition history, theme rotation, or preamble-stripping, and just
+// improvised its own quote-shaped response from conversation context
+// (prone to reaching for the same famous quote every time). This mirrors
+// the truth-or-dare session pattern: once a quote is given, a short window
+// opens during which "another one"/"new one"/etc. are recognized as a
+// request for another quote via the PROPER generateQuote() path, not
+// generic chat.
+const quoteSessionActive = new Map(); // chatJid -> expiresAt
+const QUOTE_SESSION_WINDOW_MS = 5 * 60 * 1000;
+function startQuoteSession(jid) {
+  quoteSessionActive.set(jid, Date.now() + QUOTE_SESSION_WINDOW_MS);
+}
+function isQuoteFollowup(text, jid) {
+  if ((quoteSessionActive.get(jid) || 0) <= Date.now()) return false;
+  const stripped = text.replace(/\bnayla\b/gi, "").trim();
+  return /^(new one|another one|another|one more|one more please|more|more please|next one|next|again|give me another|give me more)[.!?]*$/i.test(stripped);
+}
+
 // Natural "reply as a voice note" request — same trigger the .tts command
 // uses under the hood, just phrased conversationally instead of typed.
 const TTS_REQUEST_REGEX = /\b(voice note|\bvn\b|voice message|voice reply|say (it|that) (out loud|as a voice)|reply (with|in) (a )?voice|explain in (a )?vn)\b/i;
@@ -2317,6 +2682,7 @@ const TTS_REQUEST_REGEX = /\b(voice note|\bvn\b|voice message|voice reply|say (i
 // zero real attempts.
 const providerCooldowns = new Map(); // provider.name -> timestamp until which to skip it
 const PROVIDER_COOLDOWN_MS = 60 * 1000;
+const PROVIDER_AUTH_FAILURE_COOLDOWN_MS = 30 * 60 * 1000; // a bad key needs a human to fix it, not 60 more seconds
 
 async function callAIProvider(messages, { json = false, temperature = 0.5, timeoutMs = 12000, maxTokens = null } = {}) {
   if (PROVIDER_CHAIN.length === 0) {
@@ -2379,8 +2745,19 @@ async function callAIProvider(messages, { json = false, temperature = 0.5, timeo
       return text;
     } catch (err) {
       lastErr = err;
-      providerCooldowns.set(provider.name, Date.now() + PROVIDER_COOLDOWN_MS);
-      console.warn(`⚠️ [PROVIDER FAILOVER] ${provider.name} failed (${err.message}) — trying next provider... (cooling down for 60s)`);
+      // FIX (confirmed in production logs): a genuinely bad/revoked API key
+      // (401 / invalid_api_key) isn't going to start working again in 60
+      // seconds the way a timeout or transient rate limit might — with only
+      // the standard 60s cooldown, a permanently-invalid key gets retried
+      // and re-fails on every request that happens to land after its
+      // cooldown expires, forever, adding wasted latency each time. Auth
+      // failures now get a MUCH longer cooldown (30 min) so the chain
+      // effectively skips a dead key until someone fixes it, while every
+      // other error type keeps the original fast 60s retry.
+      const isAuthFailure = err.status === 401 || /invalid.?api.?key|unauthorized/i.test(err.message);
+      const cooldownMs = isAuthFailure ? PROVIDER_AUTH_FAILURE_COOLDOWN_MS : PROVIDER_COOLDOWN_MS;
+      providerCooldowns.set(provider.name, Date.now() + cooldownMs);
+      console.warn(`⚠️ [PROVIDER FAILOVER] ${provider.name} failed (${err.message}) — trying next provider... (cooling down for ${isAuthFailure ? "30 min — looks like a bad API key, check your .env" : "60s"})`);
       // Deliberately sequential, not Promise.all/race across providers —
       // never hammer every provider at once just because one is struggling.
       continue;
@@ -2867,25 +3244,61 @@ Hard safety rules, apply at every difficulty level, no exceptions:
 // mode, and inventing a fake line under a real person's name is worth
 // avoiding on plain accuracy grounds. Falls back to an original,
 // unattributed line whenever it isn't sure.
-async function generateQuote(vibe) {
+//
+// FIX (confirmed bug — "same quote 3x in a row, inconsistent formatting"):
+// two compounding problems. First, with no differentiating signal between
+// repeated calls, the model kept reaching for the single most statistically
+// dominant famous quote in its training data (a well-known LLM tendency —
+// mode collapse on open-ended generation) even at temperature 0.9. Second,
+// despite the JSON schema instructions, the model sometimes stuffed
+// conversational framing ("Here's one:") directly INTO the quote field
+// itself rather than returning it clean, which is why the wrapper's
+// consistent formatting still looked inconsistent in the output. Fixed
+// with three independent layers: (1) a small per-chat history of recently-
+// shown quotes fed back into the prompt as an explicit exclusion list, (2)
+// a randomly-rolled theme per call to diversify subject matter beyond pure
+// sampling temperature, (3) a defensive regex strip of common preamble
+// patterns from the parsed quote field as a safety net regardless of how
+// well the model followed instructions.
+const recentQuotesCache = new Map(); // jid -> string[] (last 5 quotes shown in that chat)
+const QUOTE_THEMES = ["perseverance", "courage", "creativity", "curiosity", "kindness", "resilience", "humility", "adventure", "gratitude", "growth", "patience", "honesty", "ambition", "friendship", "simplicity"];
+const QUOTE_PREAMBLE_STRIP_REGEX = /^(here'?s (one|a quote)[:,]?\s*|here you go[:,]?\s*|sure[,!]?\s*)/i;
+
+function recordRecentQuote(jid, quote) {
+  const history = recentQuotesCache.get(jid) || [];
+  history.push(quote);
+  if (history.length > 5) history.shift();
+  recentQuotesCache.set(jid, history);
+}
+
+async function generateQuote(vibe, jid = "global") {
+  const theme = QUOTE_THEMES[Math.floor(Math.random() * QUOTE_THEMES.length)];
+  const recentQuotes = recentQuotesCache.get(jid) || [];
+
   try {
     const raw = await callAIProvider([
-      { role: "system", content: `You are ${BOT_CONFIG.name}, sharing a deep/inspiring quote in a WhatsApp chat, "${vibe}" personality.
+      { role: "system", content: `You are ${BOT_CONFIG.name}, sharing a deep/inspiring quote in a WhatsApp chat, "${vibe}" personality. Lean toward something on the theme of "${theme}" if a good one comes to mind, but don't force it if it doesn't fit naturally.
 
 Rules:
 - If you're genuinely confident about a REAL, well-known, accurately-attributed quote that fits, use it and attribute it correctly.
 - If you're not confident a specific real quote fits — or you'd be guessing — do NOT invent a fake quote and put a real person's name on it. Instead write an ORIGINAL wise/deep line yourself, left unattributed (empty author).
 - Never fabricate a quote and attribute it to a real, named person you're not sure actually said it.
+- Pick something genuinely different each time — avoid the most overused, cliché quotes if you can think of something less predictable that still fits.
+${recentQuotes.length > 0 ? `- Do NOT repeat any of these already shown in this chat recently: ${recentQuotes.map(q => `"${q}"`).join(", ")}\n` : ""}
+- The "quote" field must contain ONLY the quote's own words — no framing like "Here's one:", no leading "Sure,", nothing conversational. Just the quote itself, verbatim.
 
 Respond ONLY with raw JSON, no other text:
-{"quote": "the quote text itself, no surrounding quote marks", "author": "the real attributed person's name, or empty string if original/unattributed"}` },
+{"quote": "the quote text itself, no surrounding quote marks, no preamble", "author": "the real attributed person's name, or empty string if original/unattributed"}` },
       { role: "user", content: "Give me a quote." }
-    ], { json: true, temperature: 0.9, timeoutMs: 8000 });
+    ], { json: true, temperature: 1.0, timeoutMs: 8000 });
 
     let cleanText = raw.trim();
     if (cleanText.startsWith("```")) cleanText = cleanText.replace(/^```json?/, "").replace(/```$/, "").trim();
     const parsed = JSON.parse(cleanText);
-    return { quote: (parsed.quote || "").trim(), author: (parsed.author || "").trim() };
+    const quote = (parsed.quote || "").trim().replace(QUOTE_PREAMBLE_STRIP_REGEX, "").replace(/^['"]|['"]$/g, "").trim();
+    const author = (parsed.author || "").trim();
+    if (quote) recordRecentQuote(jid, quote);
+    return { quote, author };
   } catch (e) {
     return { quote: "The best time to start was yesterday. The next best time is now.", author: "" };
   }
@@ -2895,11 +3308,35 @@ Respond ONLY with raw JSON, no other text:
 // prompt. searchContext is optional grounding (see the .eli5 command
 // handler, which auto-searches for current-events-flavored topics the same
 // way normal chat replies already do via shouldAutoSearch).
-async function generateEli5Explanation(topic, vibe, searchContext = "") {
+async function generateEli5Explanation(topic, vibe, searchContext = "", additionalContext = "") {
+  // FIX (confirmed bug, two layers): (1) when there's no real typed topic,
+  // the caller used to pass the literal string "this" as the topic,
+  // producing "Explain like I'm 5: this" — which the model sometimes took
+  // literally and explained the PRONOUN itself (a toy-in-a-box analogy for
+  // the word "this"). (2) Even after removing that, additionalContext
+  // lived ONLY in the system prompt while the user turn carried a vague
+  // instruction with no actual content in it — the model then produced a
+  // META-explanation of what "explaining simply" means as a concept,
+  // rather than explaining the real quoted content. Same root cause as the
+  // generateAIChatReply fix above: models attend far more reliably to what's
+  // directly in the user turn. The actual content-to-explain is now
+  // embedded directly in the user turn itself, not left for the model to
+  // cross-reference against a system-prompt aside.
+  const hasRealTopic = topic && topic.trim().length > 0 && topic.trim().toLowerCase() !== "this";
+  let userInstruction;
+  if (hasRealTopic && additionalContext) {
+    userInstruction = `[Here's what I'm replying to: "${additionalContext}"]\nExplain like I'm 5, focusing on: ${topic}`;
+  } else if (hasRealTopic) {
+    userInstruction = `Explain like I'm 5: ${topic}`;
+  } else if (additionalContext) {
+    userInstruction = `Here's the actual content I need explained: "${additionalContext}"\n\nExplain THAT (the content above) like I'm 5 — not the general concept of "explaining simply," the actual specific content itself.`;
+  } else {
+    userInstruction = `Explain like I'm 5.`; // shouldn't normally be reached — the .eli5 command itself guards against having neither a topic nor quoted content
+  }
   try {
     const raw = await callAIProvider([
-      { role: "system", content: `You are ${BOT_CONFIG.name}, "${vibe}" personality. Explain the topic like the person is 5 years old — genuinely simple, warm, vivid analogies a child could picture, but still accurate (simplify without becoming actually wrong). 3-6 sentences. No preamble like "Sure, here's an ELI5:" — just explain it directly.${searchContext ? `\n\nFresh web search results to ground this in real facts (use them naturally, don't dump raw text):\n${searchContext}` : ""}` },
-      { role: "user", content: `Explain like I'm 5: ${topic}` }
+      { role: "system", content: `You are ${BOT_CONFIG.name}, "${vibe}" personality. Explain things like the person is 5 years old — genuinely simple, warm, vivid analogies a child could picture, but still accurate (simplify without becoming actually wrong). 3-6 sentences. No preamble like "Sure, here's an ELI5:" — just explain it directly.${searchContext ? `\n\nFresh web search results to ground this in real facts (use them naturally, don't dump raw text):\n${searchContext}` : ""}` },
+      { role: "user", content: userInstruction }
     ], { json: false, temperature: 0.7, timeoutMs: 10000 });
     return raw.trim();
   } catch (e) {
@@ -2922,7 +3359,7 @@ async function generateDuplicateSpamNudge(vibe) {
 }
 
 
-async function generateAIChatReply(senderJid, sender, question, vibe = BOT_CONFIG.vibe, context = "", quotedText = null, feelingSalty = false, searchContext = "", chatJid = senderJid) {
+async function generateAIChatReply(senderJid, sender, question, vibe = BOT_CONFIG.vibe, context = "", quotedText = null, feelingSalty = false, searchContext = "", chatJid = senderJid, attachedMediaContext = null) {
   if (PROVIDER_CHAIN.length === 0) {
     console.error("🔴 [AI CHAT] No AI providers configured (GROQ_API_KEY / CEREBRAS_API_KEY_1-3 / MISTRAL_API_KEY all missing).");
     return { success: false, message: "🔑 My whole brain is unplugged right now (no AI provider keys configured) — my developer needs to fix that." };
@@ -2957,7 +3394,7 @@ Self-awareness (know this about yourself, bring it up naturally/funnily if asked
 TASK EXECUTION — this is important, read carefully: if the person is asking you to actually DO something (tell a story, write something, explain a topic, generate a list, quiz them, complete any concrete task), your reply must contain the ACTUAL CONTENT, not a preview of it. Never respond with only an announcement, a warm-up line, or "let's begin!"/"here we go!"/"buckle up!" with no actual substance attached — that is a failure. If they already asked and then follow up with "go", "continue", "yes", "ok", or similar short encouragement, that means produce the NEXT real chunk of content immediately, not another round of "alright, let's dive in." One clear round of setup is fine; repeating it is the bug to avoid. For a story/task reply, aim for roughly 100-300 words of real content (expand further only if they explicitly ask for more/longer) — casual chat replies stay short (1-4 sentences), but a requested task is not casual chat and should not be squeezed into that length.
 
 What you already remember about ${sender}: ${knownFacts}.
-${context ? `Recent conversation in this chat (for context only, don't repeat it back verbatim):\n${context}\n` : ""}${quotedText ? `IMPORTANT: ${sender} is directly replying to this specific earlier message — "${quotedText}" — answer THEIR question about/reaction to THAT message, don't ask what they mean.\n` : ""}${searchContext ? `Fresh web search results for this question (use them to ground your answer in real facts, mention naturally that you looked it up, don't just dump the raw text):\n${searchContext}\n` : ""}${feelingSalty ? `Note: there's been some rudeness in this chat in the last few minutes — you're allowed to sound a little annoyed/short about it, without being genuinely mean or holding a real grudge.\n` : ""}${distracted ? `Quirk for THIS reply only: humans sometimes get hung up on one random, non-essential word/noun in what someone said instead of the main point. Just this once, playfully latch onto one such word from their message first, THEN still briefly address their actual point too — e.g. "Honeycrisp or Granny Smith? Also yeah, send the code."\n` : ""}${explicitEmojiRequest ? `They explicitly asked for emoji/emoji content in this message — go ahead and include plenty, that request overrides the usual sparing-emoji habit.\n` : ""}
+${context ? `Recent conversation in this chat (for context only, don't repeat it back verbatim):\n${context}\n` : ""}${quotedText ? `IMPORTANT: ${sender} is directly replying to this specific earlier message — "${quotedText}" — answer THEIR question about/reaction to THAT message, don't ask what they mean.\n` : ""}${attachedMediaContext ? `IMPORTANT: ${sender} just sent THIS current message with an image directly attached to it (this is NOT a reply to something from earlier — it's brand new, right now). Here's what that image shows: ${attachedMediaContext}\nAnswer their caption/question about THIS specific image. Do not confuse this with anything mentioned earlier in the recent conversation above — this is a fresh photo, not a continuation of an earlier topic.\n` : ""}${searchContext ? `Fresh web search results for this question (use them to ground your answer in real facts, mention naturally that you looked it up, don't just dump the raw text):\n${searchContext}\n` : ""}${feelingSalty ? `Note: there's been some rudeness in this chat in the last few minutes — you're allowed to sound a little annoyed/short about it, without being genuinely mean or holding a real grudge.\n` : ""}${distracted ? `Quirk for THIS reply only: humans sometimes get hung up on one random, non-essential word/noun in what someone said instead of the main point. Just this once, playfully latch onto one such word from their message first, THEN still briefly address their actual point too — e.g. "Honeycrisp or Granny Smith? Also yeah, send the code."\n` : ""}${explicitEmojiRequest ? `They explicitly asked for emoji/emoji content in this message — go ahead and include plenty, that request overrides the usual sparing-emoji habit.\n` : ""}
 For normal conversational banter (not a task request), keep it natural and in character, 1-4 sentences, weaving in what you remember about them ONLY where it fits naturally — don't force it every time.
 Do not mention you are an AI model unless directly asked. Never store or repeat sensitive personal info (health, address, financial details).
 
@@ -2967,9 +3404,29 @@ Respond ONLY with a raw JSON object matching this schema, no other text:
   "newFact": "one short new casual/non-sensitive fact worth remembering about this person from this message, or an empty string if nothing notable"
 }`;
 
+    // FIX (confirmed bug — vision/search grounding was being ignored even
+    // though the underlying call succeeded): previously the user-facing
+    // turn was JUST `${sender} said: "${question}"`, with the image/quote
+    // context living ONLY in a long system prompt several sections deep.
+    // Models — especially the faster/smaller free-tier ones this bot relies
+    // on — attend far more reliably to what's directly in the user turn
+    // than to a system-prompt aside, so the model would answer the bare
+    // question and effectively ignore that an image was ever involved.
+    // Embedding the grounding directly into the user turn, immediately
+    // next to the actual question, fixes this at the root rather than
+    // hoping a longer/more emphatic system-prompt note gets noticed.
+    let userContent;
+    if (attachedMediaContext) {
+      userContent = `[${sender} just sent an image along with this message. What the image shows: "${attachedMediaContext}"]\n${sender}: "${question}"`;
+    } else if (quotedText) {
+      userContent = `[${sender} is replying to this earlier message: "${quotedText}"]\n${sender}: "${question}"`;
+    } else {
+      userContent = `${sender} said: "${question}"`;
+    }
+
     const raw = await callAIProvider([
       { role: "system", content: systemPrompt },
-      { role: "user", content: `${sender} said: "${question}"` }
+      { role: "user", content: userContent }
     ], { json: true, temperature: 0.8, timeoutMs: 10000, maxTokens: 700 });
 
     let cleanText = raw.trim();
@@ -3014,6 +3471,24 @@ function extractTextFromMessage(message) {
     return ""; // never let a weird/malformed media payload crash message handling
   }
   return "";
+}
+
+// FIX (confirmed bug — a bare image/sticker was getting a bizarre, confused
+// reply like "It looks like you've shared an image, but there's no
+// caption..."): extractTextFromMessage() above deliberately substitutes a
+// placeholder ("[image, no caption]", "[sticker]") for bare media, which is
+// genuinely useful for the conversation buffer/summarization — but that
+// SAME placeholder was leaking downstream as if it were a real caption:
+// fed to the vision model as its literal instruction ("[image, no
+// caption]" as the *question*), and used to decide whether to treat the
+// message as "captioned" at all. This returns the REAL caption only, or
+// null if there genuinely isn't one — never a placeholder — so vision gets
+// its own good default prompt and routing decisions are correct.
+function getRawMediaCaption(message) {
+  const content = unwrapMessageContent(message);
+  if (!content) return null;
+  const caption = content.imageMessage?.caption || content.videoMessage?.caption || null;
+  return caption && caption.trim().length > 0 ? caption.trim() : null;
 }
 
 // True when a message is media with NO real accompanying text (a bare photo/
@@ -3251,12 +3726,23 @@ const ANALYZE_INTENT_REGEX = /\b(summar(y|ise|ize)|explain|what'?s this|what is 
 // maintain. Animated stickers get the same optional sharp-based static-
 // frame extraction as a direct-message sticker (see
 // extractStaticFrameFromAnimatedWebp above).
-async function analyzeQuotedMediaAndText(senderJid, sender, userQuestion, vibe, context, feelingSalty, jid, msg) {
+// Shared context-gathering for "explain/analyze what I'm replying to" — used
+// by the combined analyzer, .tts, and .eli5, so all three see quoted media,
+// links, and phone numbers identically instead of three separate
+// implementations quietly drifting out of sync (the Section 13.1 "extend
+// the canonical implementation, don't build a parallel one" principle,
+// applied here). Handles quoted image/sticker (vision, with animated-
+// sticker frame extraction), quoted audio (transcription), and quoted text
+// (link/phone-number detection + optional safe domain-based search) — never
+// throws, always returns a usable (possibly mostly-empty) result.
+async function gatherQuotedContext(jid, msg) {
   const quotedMediaType = getQuotedMediaType(msg.message);
   const quotedTextRaw = getQuotedMessageText(msg.message);
 
   let visionDescription = "";
   let visionFailed = false;
+  let transcribedAudio = "";
+
   if (quotedMediaType === "image" || quotedMediaType === "sticker") {
     const rawBuffer = await runHeavyTask(() => downloadQuotedMedia(jid, msg.message));
     if (rawBuffer) {
@@ -3283,10 +3769,19 @@ async function analyzeQuotedMediaAndText(senderJid, sender, userQuestion, vibe, 
         else visionFailed = true;
       }
     }
+  } else if (quotedMediaType === "audio") {
+    const audioBuffer = await runHeavyTask(() => downloadQuotedMedia(jid, msg.message));
+    if (audioBuffer) {
+      const transcription = await runHeavyTask(() => transcribeAudioWithGroq(audioBuffer, "audio/ogg"));
+      if (transcription.success && transcription.text) transcribedAudio = transcription.text;
+    }
   }
 
-  const domains = extractDomains(quotedTextRaw);
-  const hasPhoneNumber = containsPhoneNumber(quotedTextRaw);
+  // Links/phone numbers can show up in a text caption OR in what someone
+  // SAID in a voice note — check whichever text we actually have.
+  const textForLinkAnalysis = quotedTextRaw || transcribedAudio;
+  const domains = extractDomains(textForLinkAnalysis);
+  const hasPhoneNumber = containsPhoneNumber(textForLinkAnalysis);
 
   // Explicit instruction: if web search would help ground the answer, use
   // it — never hold back. A detected link domain is a strong, safe signal
@@ -3294,7 +3789,7 @@ async function analyzeQuotedMediaAndText(senderJid, sender, userQuestion, vibe, 
   // ever visiting the link itself.
   let searchContext = "";
   if (domains.length > 0) {
-    const searchQuery = `${domains[0]}${quotedTextRaw ? " " + quotedTextRaw.slice(0, 150) : ""}`;
+    const searchQuery = `${domains[0]}${textForLinkAnalysis ? " " + textForLinkAnalysis.slice(0, 150) : ""}`;
     try {
       const searchResult = await runHeavyTask(() => searchWeb(searchQuery));
       if (searchResult.success && searchResult.results) searchContext = searchResult.results.slice(0, 2500);
@@ -3305,13 +3800,23 @@ async function analyzeQuotedMediaAndText(senderJid, sender, userQuestion, vibe, 
 
   const parts = [];
   if (quotedTextRaw) parts.push(`Original message text/caption: "${quotedTextRaw.slice(0, MAX_QUOTED_CONTEXT_CHARS)}"`);
+  if (transcribedAudio) parts.push(`Original voice note said: "${transcribedAudio.slice(0, MAX_QUOTED_CONTEXT_CHARS)}"`);
   if (visionDescription) parts.push(`What the attached image/sticker shows: ${visionDescription}`);
   else if (visionFailed) parts.push(`(There was an image attached but I couldn't analyze it this time — answer from the text/links alone.)`);
   if (domains.length > 0) parts.push(`Link(s) mentioned (domain identified, never actually visited): ${domains.join(", ")}`);
   if (hasPhoneNumber) parts.push(`Note: the original message includes what looks like a phone number — don't repeat it back verbatim, just acknowledge it's there if it's relevant to answering.`);
-  const enrichedQuotedText = parts.join("\n") || null;
 
-  return generateAIChatReply(senderJid, sender, userQuestion, vibe, context, enrichedQuotedText, feelingSalty, searchContext, jid);
+  return {
+    quotedTextRaw, visionDescription, visionFailed, transcribedAudio,
+    domains, hasPhoneNumber, searchContext,
+    enrichedContextText: parts.join("\n") || null,
+    hadAnyQuotedContent: !!(quotedTextRaw || visionDescription || transcribedAudio)
+  };
+}
+
+async function analyzeQuotedMediaAndText(senderJid, sender, userQuestion, vibe, context, feelingSalty, jid, msg) {
+  const gathered = await gatherQuotedContext(jid, msg);
+  return generateAIChatReply(senderJid, sender, userQuestion, vibe, context, gathered.enrichedContextText, feelingSalty, gathered.searchContext, jid);
 }
 
 // Summarize an arbitrary quoted message. Anti-crash: hard-caps input length
@@ -3699,10 +4204,36 @@ async function startBot() {
         }
       }
 
+      // FIX (confirmed bug — .settings showing "Messages received: 0" and
+      // .activity showing an all-zero heatmap despite real, sustained
+      // activity): this bookkeeping previously ran AFTER handleCommand's
+      // `continue`, so a session consisting mostly of typed dot-commands
+      // (.eli5, .tts, .settings, .quote, etc. — exactly what real usage
+      // often looks like) never reached it at all. messagesReceived/daily
+      // stats/activity-hour are meant to reflect ALL incoming traffic,
+      // commands included, so this now runs BEFORE command routing.
+      // bumpUserStats (XP/rank) is deliberately NOT moved — it stays
+      // scoped to genuine non-command chat only, so rapid-firing commands
+      // can't be used to farm XP; that's a separate, correct design choice
+      // from "did the bot receive a message" bookkeeping.
+      const isGroup = jid.endsWith("@g.us");
+      if (isGroup) {
+        getGroupConfig(jid).messagesReceived++;
+        bumpDailyStats(jid, sender, text);
+        bumpActivityHour(jid);
+      }
+
       // --- 0. Command router (.rank, .stats, .lock, .unlock) — handled
       // entirely separately from moderation/AI-chat, zero Groq cost.
       const wasCommand = await handleCommand(sock, jid, senderJid, sender, text, msg);
-      if (wasCommand) continue;
+      if (wasCommand) {
+        // Approximate but reasonable: virtually every recognized command
+        // sends exactly one reply before returning true. Instrumenting
+        // every individual command branch for a precise count isn't worth
+        // the maintenance cost for what's meant to be a rough diagnostic.
+        if (isGroup) getGroupConfig(jid).responsesSent++;
+        continue;
+      }
 
       // FIX: anything starting with "." is a command ATTEMPT, recognized or
       // not — never spam/link moderation material. Confirmed bug: Groq's own
@@ -3714,21 +4245,13 @@ async function startBot() {
         const dotCmdVibe = jid.endsWith("@g.us") ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
         const reply = await generateUnknownCommandReply(text.trim(), dotCmdVibe);
         await sock.sendMessage(jid, { text: reply }, { quoted: msg }).catch(() => {});
+        if (isGroup) getGroupConfig(jid).responsesSent++;
         continue;
       }
 
       // --- Gamification bookkeeping — pure local, no AI cost, runs for
-      // every real message including media (harmless, no AI cost).
+      // every real (non-command) message including media (harmless, no AI cost).
       bumpUserStats(senderJid, sender);
-      const isGroup = jid.endsWith("@g.us");
-      if (isGroup) {
-        getGroupConfig(jid).messagesReceived++;
-        // Daily Newspaper + Activity Heatmap bookkeeping — both pure local
-        // Map increments, zero AI cost, group-scoped only (a DM has no
-        // "top chatter" or hourly-activity concept worth tracking).
-        bumpDailyStats(jid, sender, text);
-        bumpActivityHour(jid);
-      }
 
       const vibe = isGroup ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
 
@@ -3881,24 +4404,32 @@ async function startBot() {
         if (!incomingMediaType && isImageGenerationIntent(text)) {
           const imaginePrompt = extractImageGenerationPrompt(text);
           if (imaginePrompt) {
+            if (isHeavyCommandCoolingDown(senderJid, "imagine")) {
+              await sock.sendMessage(jid, { text: "😅 One image at a time — give me a few seconds between requests." }, { quoted: msg }).catch(() => {});
+              continue;
+            }
+            setHeavyCommandCooldown(senderJid, "imagine");
             const ackLine = await generateImageAckLine(vibe);
             await sendLikeAHuman(sock, jid, msg, ackLine);
             if (isGroup) await bufferGroupMessage(jid, BOT_CONFIG.name, ackLine);
             try {
               await runHeavyTask(async () => {
-                const url = buildImagineUrl(imaginePrompt);
-                await sock.sendMessage(jid, { image: { url }, caption: `🎨 *${imaginePrompt}*` }, { quoted: msg });
+                const imageBuffer = await generateAndValidateImage(imaginePrompt);
+                await sock.sendMessage(jid, { image: imageBuffer, caption: `🎨 *${imaginePrompt}*` }, { quoted: msg });
               });
+              console.log(`✅ [IMAGINE] Sent generated image (natural language) for "${imaginePrompt.slice(0, 60)}".`);
               if (isGroup) getGroupConfig(jid).responsesSent++;
             } catch (err) {
               const failText = err.message === "HEAVY_QUEUE_FULL"
                 ? "😅 I'm pretty swamped right now — give me a minute and try that again?"
                 : "🎨 Something went wrong generating that — try again, maybe with a simpler description?";
+              console.error(`❌ [IMAGINE] Failed (natural language) for "${imaginePrompt.slice(0, 60)}": ${err.message}`);
               await sock.sendMessage(jid, { text: failText }, { quoted: msg }).catch(() => {});
             }
             continue;
           }
         }
+
 
         // --- Truth or Dare / Quote — natural language, never canned.
         // "Let's play truth or dare" opens a 15-min session (AI-generated
@@ -3932,8 +4463,9 @@ async function startBot() {
           if (isGroup) await bufferGroupMessage(jid, BOT_CONFIG.name, reply);
           continue;
         }
-        if (!incomingMediaType && QUOTE_REQUEST_REGEX.test(text)) {
-          const { quote, author } = await generateQuote(vibe);
+        if (!incomingMediaType && (QUOTE_REQUEST_REGEX.test(text) || isQuoteFollowup(text, jid))) {
+          startQuoteSession(jid); // refresh the window so "another one" keeps working
+          const { quote, author } = await generateQuote(vibe, jid);
           const reply = author ? `"${quote}"\n— ${author}` : `"${quote}"`;
           await sendLikeAHuman(sock, jid, msg, reply);
           if (isGroup) await bufferGroupMessage(jid, BOT_CONFIG.name, reply);
@@ -3970,11 +4502,61 @@ async function startBot() {
                 }
               }
 
+              // FIX (confirmed bug): a bare/uncaptioned image or ANY sticker
+              // (stickers can't have captions at all) previously used the
+              // pipeline's `text` variable here — which extractTextFromMessage()
+              // deliberately sets to a PLACEHOLDER like "[image, no caption]"
+              // or "[sticker]" for bare media. That placeholder was being fed
+              // to vision as its literal instruction (confusing it) and was
+              // ALSO truthy/non-empty, so the routing logic below incorrectly
+              // treated EVERY bare sticker and every uncaptioned image as if
+              // it had a real caption, producing confused generic replies
+              // instead of an actual image description. rawCaption is null
+              // (never a placeholder) for genuinely uncaptioned media.
+              const rawCaption = getRawMediaCaption(msg.message);
               const base64Image = visionBuffer.toString("base64");
-              const visionResult = await runHeavyTask(() => analyzeImageWithGemini(base64Image, mimeType, text || null));
-              await sendLikeAHuman(sock, jid, msg, visionResult.message);
+              const visionResult = await runHeavyTask(() => analyzeImageWithGemini(base64Image, mimeType, rawCaption));
+
+              if (!visionResult.success) {
+                await sendLikeAHuman(sock, jid, msg, visionResult.message);
+              } else if (rawCaption) {
+                // A REAL caption/question — route the final answer through
+                // the normal chat-reply synthesis (personality, memory of
+                // the sender, and real web search if the caption calls for
+                // it) instead of just relaying vision's raw factual
+                // description verbatim. Mirrors exactly how the combined
+                // quoted-media analyzer already handles this.
+                //
+                // FIX (confirmed bug — bot hallucinating about unrelated
+                // EARLIER conversation, e.g. "I was in the middle of
+                // creating a cat image..." for a completely fresh photo):
+                // the vision description used to be injected via the
+                // `quotedText` parameter, whose prompt wording explicitly
+                // says "replying to this specific EARLIER message" — wrong
+                // framing entirely for an image attached directly to THIS
+                // message. Now uses the correctly-labeled
+                // attachedMediaContext parameter instead, with quotedText
+                // left null since this genuinely isn't a reply to anything.
+                const feelingSaltyNow = isGroup && (recentRudenessFlag.get(jid) || 0) > Date.now();
+                let captionSearchContext = "";
+                if (shouldAutoSearch(rawCaption, vibe)) {
+                  try {
+                    const searchResult = await runHeavyTask(() => searchWeb(rawCaption));
+                    if (searchResult.success && searchResult.results) captionSearchContext = searchResult.results.slice(0, 2500);
+                  } catch (err) { /* proceed without grounding rather than block the answer */ }
+                }
+                const synthesized = await generateAIChatReply(senderJid, sender, rawCaption, vibe, getRecentContext(jid), null, feelingSaltyNow, captionSearchContext, jid, visionResult.message);
+                await sendLikeAHuman(sock, jid, msg, synthesized.message, synthesized.allowEmoji);
+                if (isGroup && synthesized.success) await bufferGroupMessage(jid, BOT_CONFIG.name, synthesized.message);
+              } else {
+                // Bare, uncaptioned image OR any sticker (stickers can't
+                // carry captions at all) — just relay vision's description
+                // directly, cheaper and simpler with no real question to
+                // synthesize an answer to.
+                await sendLikeAHuman(sock, jid, msg, visionResult.message);
+                if (isGroup) await bufferGroupMessage(jid, BOT_CONFIG.name, visionResult.message);
+              }
               if (isGroup) getGroupConfig(jid).responsesSent++;
-              if (isGroup && visionResult.success) await bufferGroupMessage(jid, BOT_CONFIG.name, visionResult.message);
             } else {
               await sock.sendMessage(jid, { text: "👀 That image didn't come through cleanly on my end — try sending it again?" }, { quoted: msg }).catch(() => {});
             }
@@ -3992,13 +4574,21 @@ async function startBot() {
         const quotedTextRaw = getQuotedMessageText(msg.message);
         const quotedMediaType = getQuotedMediaType(msg.message);
         const hasQuotedMedia = quotedMediaType === "image" || quotedMediaType === "sticker";
-        // Broader than a bare "summary" match now (ANALYZE_INTENT_REGEX also
-        // covers "explain"/"what's this"/"analyze"/"describe"/"breakdown"),
-        // OR the person just addressed the bot with barely any words while
-        // swipe-replying to media (e.g. a bare "Nayla?") — that's the same
-        // implicit "what is this?" a human would read it as.
-        const strippedAddressText = text.replace(/\bnayla\b/gi, "").trim();
-        const wantsCombinedAnalysis = hasQuotedMedia && (ANALYZE_INTENT_REGEX.test(text) || strippedAddressText.length <= 12);
+        // FIX (confirmed bug — "Tell me about this picture" and similar
+        // natural phrasings were silently failing to trigger analysis at
+        // all): previously required matching a fixed word list
+        // (ANALYZE_INTENT_REGEX: summarize/explain/what's this/analyze/
+        // describe/breakdown) or a very short remaining message — anything
+        // else, however clearly about the image, fell through to a plain
+        // text-only reply with zero access to the actual picture. By this
+        // point in the pipeline, truth/dare/quote/tts triggers have ALREADY
+        // been checked and would have `continue`d if matched — so simply
+        // replying to media while addressing the bot is itself sufficient
+        // signal on its own. Vision is free (no per-call cost) and already
+        // protected by the runHeavyTask concurrency limiter, so there's no
+        // real downside to always looking rather than pattern-matching the
+        // wording first.
+        const wantsCombinedAnalysis = hasQuotedMedia;
         const wantsSummary = !hasQuotedMedia && quotedTextRaw && /\bsummar(y|ise|ize)\b/i.test(text);
         const quotedText = (quotedTextRaw && quotedTextRaw.length > MAX_QUOTED_CONTEXT_CHARS)
           ? quotedTextRaw.slice(0, MAX_QUOTED_CONTEXT_CHARS) + "... [truncated]"
@@ -4071,7 +4661,8 @@ async function startBot() {
         }
 
         try {
-          if (wantsVoiceReply && aiResult.success) {
+          if (wantsVoiceReply && aiResult.success && !isHeavyCommandCoolingDown(senderJid, "tts")) {
+            setHeavyCommandCooldown(senderJid, "tts");
             // Natural "explain this in a voice note" / .tts request —
             // convert the SAME answer that would've been sent as text into
             // real speech instead. Anti-crash per the standing rule: if
@@ -4081,7 +4672,7 @@ async function startBot() {
             try {
               const speech = await runHeavyTask(() => generateSpeechAudio(aiResult.message));
               if (speech.success) {
-                await sendMessageWithTimeout(sock, jid, { audio: speech.buffer, mimetype: speech.mimeType, ptt: true }, { quoted: msg });
+                await sendMessageWithTimeout(sock, jid, { audio: speech.buffer, mimetype: speech.mimeType, ptt: speech.isVoiceNote }, { quoted: msg });
               } else {
                 await sendLikeAHuman(sock, jid, msg, `🔇 _(voice note unavailable right now, here's the text)_\n\n${aiResult.message}`, aiResult.allowEmoji);
               }
